@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+
+# Jupyter
+.ipynb_checkpoints
+
+# Data (F1 data gets big)
+data/cache/
+*.csv
+
+# IDEs
+.vscode/
+.idea/
