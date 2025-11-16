@@ -1,19 +1,17 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-
-# Jupyter
-.ipynb_checkpoints
-
-# Data (F1 data gets big)
+# Data cache (too large for GitHub)
 data/cache/
-*.csv
+*.cache
+*.pkl
+*.pickle
 
-# IDEs
-.vscode/
-.idea/
+# Jupyter checkpoints
+.ipynb_checkpoints/
+__pycache__/
+
+# Large data files
+*.csv
+*.parquet
+
+# Python virtual environment
+venv/
+env/
