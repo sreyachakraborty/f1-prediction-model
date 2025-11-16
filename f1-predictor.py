@@ -1,4 +1,4 @@
-# f1_predictor.py
+# f1_predictor_2025.py
 
 import fastf1
 import pandas as pd
@@ -45,9 +45,12 @@ TRACK_DATA = {
     "United States Grand Prix": {"Downforce": "medium", "Category": "permanent", "LengthKM": 5.5, "Corners": 20, "StopGo": 2},
     "Mexico City Grand Prix": {"Downforce": "high-altitude", "Category": "permanent", "LengthKM": 4.3, "Corners": 17, "StopGo": 2},
     "Brazilian Grand Prix": {"Downforce": "high", "Category": "permanent", "LengthKM": 4.3, "Corners": 15, "StopGo": 2},
+    "São Paulo Grand Prix": {"Downforce": "high", "Category": "permanent", "LengthKM": 4.3, "Corners": 15, "StopGo": 2},
     "Las Vegas Grand Prix": {"Downforce": "low", "Category": "street", "LengthKM": 6.2, "Corners": 17, "StopGo": 2},
     "Qatar Grand Prix": {"Downforce": "medium", "Category": "permanent", "LengthKM": 5.4, "Corners": 16, "StopGo": 1},
     "Abu Dhabi Grand Prix": {"Downforce": "medium", "Category": "permanent", "LengthKM": 5.3, "Corners": 16, "StopGo": 2},
+    "Chinese Grand Prix": {"Downforce": "medium", "Category": "permanent", "LengthKM": 5.5, "Corners": 16, "StopGo": 2},
+    "Emilia Romagna Grand Prix": {"Downforce": "high", "Category": "permanent", "LengthKM": 4.9, "Corners": 19, "StopGo": 1},
 }
 
 # ---------------------------
@@ -99,20 +102,92 @@ def load_qualifying_results(year: int, round_number: int) -> pd.DataFrame:
 
     return quali
 
+def load_practice_data(year: int, round_number: int) -> dict:
+    """
+    Load FP2 and FP3 data for a given race.
+    Returns a dict with FP2/FP3 features per driver.
+    """
+    fp_features = {}
+    
+    # Small delay before practice session loading
+    
+    # Load FP2 (race pace)
+    try:
+        fp2 = fastf1.get_session(year, round_number, 'FP2')
+        fp2.load()
+        
+        for driver in fp2.drivers:
+            driver_laps = fp2.laps.pick_driver(driver)
+            
+            if len(driver_laps) > 0:
+                # Filter to representative laps (not in/out laps, no errors)
+                clean_laps = driver_laps[
+                    (driver_laps['LapTime'].notna()) & 
+                    (driver_laps['PitOutTime'].isna()) &
+                    (driver_laps['PitInTime'].isna())
+                ]
+                
+                if len(clean_laps) > 5:  # Need enough laps for statistics
+                    # Convert lap times to seconds
+                    lap_times = clean_laps['LapTime'].dt.total_seconds()
+                    
+                    # Race pace = average of laps 5-15 (exclude first few + outliers)
+                    if len(lap_times) >= 10:
+                        race_pace_laps = lap_times.iloc[4:15]  # Laps 5-15
+                        
+                        fp_features[driver] = {
+                            'FP2_AvgLapTime': race_pace_laps.mean(),
+                            'FP2_Consistency': race_pace_laps.std(),
+                            'FP2_TireDeg': None
+                        }
+                        
+                        # Tire degradation: slope of lap times over stint
+                        if len(race_pace_laps) >= 8:
+                            x = np.arange(len(race_pace_laps))
+                            y = race_pace_laps.values
+                            slope = np.polyfit(x, y, 1)[0]
+                            fp_features[driver]['FP2_TireDeg'] = slope
+                            
+    except Exception as e:
+        print(f"      FP2 unavailable: {str(e)[:50]}...")
+        pass  # Continue to FP3 even if FP2 fails
+    
+    # Small delay between FP2 and FP3
+    
+    # Load FP3 (quali pace)
+    try:
+        fp3 = fastf1.get_session(year, round_number, 'FP3')
+        fp3.load()
+        
+        for driver in fp3.drivers:
+            if driver not in fp_features:
+                fp_features[driver] = {}
+            
+            driver_laps = fp3.laps.pick_driver(driver)
+            
+            if len(driver_laps) > 0:
+                # Best lap in FP3
+                best_lap = driver_laps['LapTime'].min()
+                if pd.notna(best_lap):
+                    fp_features[driver]['FP3_BestLap'] = best_lap.total_seconds()
+                    
+    except Exception as e:
+        print(f"      FP3 unavailable: {str(e)[:50]}...")
+        pass  # Return whatever FP2 data we got
+    
+    return fp_features
+
+import time
 
 def load_season_results(year: int) -> pd.DataFrame:
     """
     Load race results for a given season using FastF1.
-
-    Returns a DataFrame with one row per driver per race, including:
-    Year, RoundNumber, RaceName, Driver, TeamName, GridPosition, Position, Points, Quali data.
+    NOW INCLUDES PRACTICE DATA with robust error handling!
     """
     print(f"\n=== Loading season {year} ===")
     schedule = fastf1.get_event_schedule(year, include_testing=False)
 
     all_results = []
-
-    # Only keep rounds that have a race ("R" session)
     race_events = schedule[schedule["EventFormat"].notna()]
 
     for _, event in race_events.iterrows():
@@ -120,45 +195,80 @@ def load_season_results(year: int) -> pd.DataFrame:
         race_name = event["EventName"]
 
         print(f"  -> Loading {year} Round {rnd}: {race_name}")
-        session = fastf1.get_session(year, rnd, "R")
-        session.load(laps=False, telemetry=False, weather=False)
-
-        res = session.results
-        df_res = res[[
-            "Abbreviation", "DriverNumber", "TeamName",
-            "GridPosition", "Position", "Points"
-        ]].copy()
-
-        # Rename first so "Driver" exists for merging
-        df_res.rename(columns={
-            "Abbreviation": "Driver",
-        }, inplace=True)
-
-        # Add qualifying data
+        
+        # ADD DELAY to avoid rate limiting
+        
         try:
-            quali_df = load_qualifying_results(year, rnd)
-            df_res = df_res.merge(
-                quali_df[["Driver", "BestQualiLap", "QualiPosition"]],
-                on="Driver",
-                how="left",
-            )
+            # Load race session
+            session = fastf1.get_session(year, rnd, "R")
+            session.load(laps=False, telemetry=False, weather=False)
+
+            res = session.results
+            df_res = res[[
+                "Abbreviation", "DriverNumber", "TeamName",
+                "GridPosition", "Position", "Points"
+            ]].copy()
+
+            df_res.rename(columns={"Abbreviation": "Driver"}, inplace=True)
+
+            # Add qualifying data
+            try:
+                quali_df = load_qualifying_results(year, rnd)
+                df_res = df_res.merge(
+                    quali_df[["Driver", "BestQualiLap", "QualiPosition"]],
+                    on="Driver",
+                    how="left",
+                )
+            except Exception as e:
+                print(f"    ⚠️  Qualifying data failed: {e}")
+                df_res["BestQualiLap"] = np.nan
+                df_res["QualiPosition"] = np.nan
+
+            # Add practice data with robust error handling
+            try:
+                print(f"    Loading practice sessions...")
+                fp_data = load_practice_data(year, rnd)
+                
+                # Add practice features to dataframe
+                df_res['FP2_AvgLapTime'] = df_res['Driver'].map(
+                    lambda d: fp_data.get(d, {}).get('FP2_AvgLapTime', np.nan)
+                )
+                df_res['FP2_Consistency'] = df_res['Driver'].map(
+                    lambda d: fp_data.get(d, {}).get('FP2_Consistency', np.nan)
+                )
+                df_res['FP2_TireDeg'] = df_res['Driver'].map(
+                    lambda d: fp_data.get(d, {}).get('FP2_TireDeg', np.nan)
+                )
+                df_res['FP3_BestLap'] = df_res['Driver'].map(
+                    lambda d: fp_data.get(d, {}).get('FP3_BestLap', np.nan)
+                )
+                print(f"    ✓ Practice data loaded")
+                
+            except Exception as e:
+                print(f"    ⚠️  Practice data failed, using NaN: {e}")
+                df_res['FP2_AvgLapTime'] = np.nan
+                df_res['FP2_Consistency'] = np.nan
+                df_res['FP2_TireDeg'] = np.nan
+                df_res['FP3_BestLap'] = np.nan
+
+            df_res["Year"] = year
+            df_res["RoundNumber"] = rnd
+            df_res["RaceName"] = race_name
+
+            all_results.append(df_res)
+            
         except Exception as e:
-            print(f"  !! Qualifying data missing for {year} Round {rnd}: {e}")
-            df_res["BestQualiLap"] = np.nan
-            df_res["QualiPosition"] = np.nan
+            print(f"  ✗ Failed to load race {rnd}: {e}")
+            continue  # Skip this race and move to next
 
-        df_res["Year"] = year
-        df_res["RoundNumber"] = rnd
-        df_res["RaceName"] = race_name
-
-        all_results.append(df_res)
-
+    if not all_results:
+        raise ValueError(f"Failed to load any races for {year}")
+    
     season_df = pd.concat(all_results, ignore_index=True)
-    print(f"Loaded {len(season_df)} driver-race rows for {year}.")
+    print(f"✓ Loaded {len(season_df)} driver-race rows for {year}.")
     return season_df
 
-
-def build_dataset(start_year: int = 2022, end_year: int = 2024) -> pd.DataFrame:
+def build_dataset(start_year: int = 2022, end_year: int = 2025) -> pd.DataFrame:
     """
     Build a combined dataset from start_year to end_year (inclusive).
     """
@@ -292,19 +402,6 @@ def add_team_strength_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def get_street_track_flag(race_name: str) -> int:
-    """
-    Very simple heuristic for street circuits.
-    Extend this mapping as needed.
-    """
-    street_keywords = [
-        "Monaco", "Singapore", "Azerbaijan", "Baku", "Saudi", "Jeddah",
-        "Las Vegas", "Miami", "Melbourne", "Australia", "Canada"
-    ]
-    race_name = str(race_name)
-    return int(any(kw.lower() in race_name.lower() for kw in street_keywords))
-
-
 def add_track_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -409,6 +506,30 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df["GridPosition_Adjusted"] = np.log1p(df["GridPosition"])
 
     # ---------------------------
+    # Practice session features
+    # ---------------------------
+    
+    # Gap to fastest in FP2 (race pace)
+    df['FP2_GapToFastest'] = (
+        df['FP2_AvgLapTime'] - df.groupby(['Year', 'RoundNumber'])['FP2_AvgLapTime'].transform('min')
+    )
+    
+    # Gap to fastest in FP3 (quali pace)
+    df['FP3_GapToFastest'] = (
+        df['FP3_BestLap'] - df.groupby(['Year', 'RoundNumber'])['FP3_BestLap'].transform('min')
+    )
+    
+    # Race pace vs quali pace (shows who has better race car)
+    df['RacePace_vs_QualiPace'] = df['FP2_AvgLapTime'] - df['FP3_BestLap']
+    
+    # Rolling average of practice performance
+    df['Driver_RollingFP2Pace'] = (
+        df.groupby('Driver')['FP2_GapToFastest']
+        .transform(lambda x: x.shift(1).ewm(span=4, min_periods=1).mean())
+    )
+    
+
+    # ---------------------------
     # Teammate race-based features
     # ---------------------------
     team_groups = df.groupby(["Year", "RoundNumber", "TeamName"])
@@ -436,7 +557,7 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df["Season_QualiBeatTeammate"] = df.groupby(["Year", "Driver"])["BeatTeammateInQuali"].transform(lambda x: x.shift(1).cumsum())
 
     # ---------------------------
-    # Weighted teammate effect (Fix #2)
+    # Weighted teammate effect
     # ---------------------------
     df["Weighted_RaceDeltaToTeammate"] = df["RaceDeltaToTeammate"] * 0.5
     df["Weighted_QualiVsTeammate"] = df["QualiVsTeammate"] * 0.5
@@ -445,7 +566,7 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df["Weighted_RollingQualiDelta"] = df["Driver_RollingQualiDelta"] * 0.5
 
     # ---------------------------
-    # Constructor strength (Fix #3)
+    # Constructor strength
     # ---------------------------
     df = add_team_strength_features(df)
 
@@ -510,6 +631,16 @@ def get_feature_columns(df: pd.DataFrame | None = None):
         "TrackLengthKM",
         "Corners",
         "StopGo",
+
+        # Practice features
+        "FP2_AvgLapTime",
+        "FP2_Consistency",
+        "FP2_TireDeg",
+        "FP3_BestLap",
+        "FP2_GapToFastest",
+        "FP3_GapToFastest",
+        "RacePace_vs_QualiPace",
+        "Driver_RollingFP2Pace",
     ]
 
     if df is not None:
@@ -550,8 +681,8 @@ def prepare_train_val_split(df: pd.DataFrame):
     """
     Split into train and validation sets:
 
-    - Train: 2022, 2023, and first half of 2024 (RoundNumber <= 10)
-    - Val:   second half of 2024 (RoundNumber > 10)
+    - Train: All of 2022, 2023, 2024
+    - Val:   All of 2025
     """
     feature_cols = get_feature_columns(df)
 
@@ -559,8 +690,8 @@ def prepare_train_val_split(df: pd.DataFrame):
     df[feature_cols] = df[feature_cols].fillna(df[feature_cols].mean())
 
     # Define masks
-    train_mask = (df["Year"] < 2024) | ((df["Year"] == 2024) & (df["RoundNumber"] <= 10))
-    val_mask = (df["Year"] == 2024) & (df["RoundNumber"] > 10)
+    train_mask = (df["Year"] < 2025)
+    val_mask = (df["Year"] == 2025)
 
     df_train = df[train_mask].copy()
     df_val = df[val_mask].copy()
@@ -571,8 +702,8 @@ def prepare_train_val_split(df: pd.DataFrame):
     X_val = df_val[feature_cols]
     y_val = df_val["Position"]
 
-    print(f"\nTrain size: {len(X_train)} rows")
-    print(f"Val size:   {len(X_val)} rows")
+    print(f"\nTrain size: {len(X_train)} rows (2022-2024)")
+    print(f"Val size:   {len(X_val)} rows (2025)")
 
     return X_train, y_train, X_val, y_val, feature_cols, df_train, df_val
 
@@ -679,7 +810,7 @@ def train_and_evaluate_multiple_models(df_features: pd.DataFrame):
 
     # Make a simple leaderboard (sorted by MAE)
     if results:
-        print("\n==================== Model Leaderboard (race-level) ====================")
+        print("\n==================== Model Leaderboard (2025 Test Set) ====================")
         results_sorted = sorted(results, key=lambda m: m["MAE"])
         for m in results_sorted:
             print(
@@ -833,7 +964,7 @@ def evaluate_model_race_ranking(
         "NumRaces": len(mae_list),
     }
 
-    print(f"\n=== Race-level metrics for {model_name} ===")
+    print(f"\n=== Race-level metrics for {model_name} (2025 Test Set) ===")
     print(f"Races evaluated:   {metrics['NumRaces']}")
     print(f"Avg MAE:           {metrics['MAE']:.3f}")
     print(f"Avg RMSE:          {metrics['RMSE']:.3f}")
@@ -852,16 +983,16 @@ def main():
     # 1. Enable cache
     enable_fastf1_cache("./fastf1_cache")
 
-    # 2. Build dataset for 2022-2024
-    df_raw = build_dataset(start_year=2022, end_year=2024)
+    # 2. Build dataset for 2022-2025
+    df_raw = build_dataset(start_year=2022, end_year=2025)
 
     # 3. Add all features
     df_features = add_features(df_raw)
 
-    # 4. Train and evaluate multiple models (race-level)
+    # 4. Train and evaluate multiple models (2025 as test set!)
     trained_models, results = train_and_evaluate_multiple_models(df_features)
 
-    # 5. Optionally: pick the best model (lowest MAE) and show predictions for last 2024 race
+    # 5. Optionally: pick the best model and show predictions
     if results:
         best = sorted(results, key=lambda m: m["MAE"])[0]
         best_name = best["model"]
@@ -869,18 +1000,20 @@ def main():
 
         model, feature_cols = trained_models[best_name]
 
-        # use df_features to predict a specific race (e.g., last 2024 round)
-        df_2024 = df_features[df_features["Year"] == 2024]
-        if not df_2024.empty:
-            last_round = int(df_2024["RoundNumber"].max())
-            predict_race_order(
-                df_features,
-                model,
-                feature_cols,
-                year=2024,
-                round_number=last_round,
-                top_n=10,
-            )
+        # Predict a few 2025 races as examples
+        df_2025 = df_features[df_features["Year"] == 2025]
+        if not df_2025.empty:
+            # Show predictions for first few 2025 races
+            rounds_to_predict = df_2025["RoundNumber"].unique()[:3]
+            for rnd in rounds_to_predict:
+                predict_race_order(
+                    df_features,
+                    model,
+                    feature_cols,
+                    year=2025,
+                    round_number=int(rnd),
+                    top_n=10,
+                )
 
 
 if __name__ == "__main__":
