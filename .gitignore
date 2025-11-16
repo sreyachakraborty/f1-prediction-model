@@ -15,3 +15,5 @@ __pycache__/
 # Python virtual environment
 venv/
 env/
+*.ipynb
+fastf1_cache/
